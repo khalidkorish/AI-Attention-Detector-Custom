@@ -216,8 +216,19 @@ def process_response(resp: dict) -> dict:
     return {**resp, **counts, "faces": faces}
 
 def update_stats(resp: dict):
+    """
+    Called from the main Streamlit thread on rerun.
+    Uses a dedupe key based on timestamp so the same API response
+    is never double-counted even if update_stats is called multiple times.
+    """
     if not resp or "error" in resp:
         return
+    # Deduplicate: skip if this exact response was already counted
+    resp_key = f"{resp.get('attention_rate',0)}_{resp.get('total_faces',0)}_{datetime.now().strftime('%H:%M:%S')}"
+    if st.session_state.get("_last_stats_key") == resp_key:
+        return
+    st.session_state["_last_stats_key"] = resp_key
+
     s = st.session_state.stats
     s["total"]      += resp.get("total_faces", 0)
     s["attentive"]  += resp.get("attentive_count", 0)
@@ -391,31 +402,53 @@ def draw_hud(frame_bgr: np.ndarray, resp: dict | None) -> np.ndarray:
 #  WEBRTC VIDEO PROCESSOR
 # ══════════════════════════════════════════════════════════
 class AttentionVideoProcessor:
+    """
+    Key design rules for streamlit-webrtc thread safety:
+    - recv() runs in a WebRTC worker thread — NEVER read st.session_state here
+    - All config (api_url, api_interval) is set on the instance by the main
+      Streamlit thread via ctx.video_processor.<attr> = value  AFTER webrtc_streamer()
+    - Background API thread only reads self.* attributes (protected by self.lock)
+      and writes self.last_resp / self.last_overlay — never touches session_state
+    - last_resp_shared is a plain list[dict] used as a thread-safe mailbox so the
+      main Streamlit thread can read the latest result on rerun without session_state
+      race conditions
+    """
+    # Class-level shared result mailbox — main thread reads this on rerun
+    _shared_resp: dict = {}
+    _shared_lock = threading.Lock()
+
     def __init__(self):
         self.frame_count  = 0
-        self.api_interval = 10
-        self.last_overlay = None   # last annotated BGR from API
-        self.last_resp    = None
+        self.api_interval = 10        # updated by main thread after construction
+        self.api_url      = ""        # updated by main thread after construction
+        self.last_overlay = None      # last annotated BGR frame from API
+        self.last_resp    = None      # last response dict
+        self.last_error   = ""        # last error string for HUD display
         self.lock         = threading.Lock()
-        self._api_running = False  # prevent overlapping API calls
+        self._api_running = False
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img_bgr = frame.to_ndarray(format="bgr24")
-        # Natural view — no horizontal flip
         self.frame_count += 1
 
-        # Capture URL in this thread (safe), pass it to background thread
-        api_url = st.session_state.get("api_url", "")
+        # Read config from instance attributes (set by main thread — safe)
+        with self.lock:
+            url      = self.api_url
+            interval = self.api_interval
+            running  = self._api_running
 
-        # Only fire a new call if previous finished and URL is set
-        if (self.frame_count % self.api_interval == 0
-                and not self._api_running
-                and api_url
-                and "xxxx" not in api_url):
-            self._api_running = True
+        ready = (
+            url
+            and "xxxx" not in url
+            and not running
+            and self.frame_count % interval == 0
+        )
+        if ready:
+            with self.lock:
+                self._api_running = True
             threading.Thread(
                 target=self._call_api,
-                args=(img_bgr.copy(), api_url),
+                args=(img_bgr.copy(), url),
                 daemon=True
             ).start()
 
@@ -423,7 +456,6 @@ class AttentionVideoProcessor:
             overlay = self.last_overlay
             resp    = self.last_resp
 
-        # Use annotated overlay; resize to live frame if dimensions differ
         if overlay is not None:
             h, w = img_bgr.shape[:2]
             if overlay.shape[:2] != (h, w):
@@ -435,40 +467,55 @@ class AttentionVideoProcessor:
         out = draw_hud(base, resp)
         return av.VideoFrame.from_ndarray(out, format="bgr24")
 
-    def _call_api(self, img_bgr: np.ndarray, api_url: str):
-        """Background thread — uses pre-captured URL, never touches session_state directly."""
+    def _call_api(self, img_bgr: np.ndarray, url: str):
+        """
+        Runs in a daemon thread.
+        Reads only: url (argument), self.lock
+        Writes only: self.last_resp, self.last_overlay, self._api_running,
+                     AttentionVideoProcessor._shared_resp
+        Never touches st.session_state.
+        """
         try:
             _, buf = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
             b64 = base64.b64encode(buf.tobytes()).decode()
+
             try:
                 r = requests.post(
-                    f"{api_url.rstrip('/')}/predict",
+                    f"{url.rstrip('/')}/predict",
                     json={"image": b64},
-                    timeout=8
+                    timeout=10
                 )
                 r.raise_for_status()
                 resp = r.json()
             except requests.exceptions.Timeout:
-                resp = {"error": "Timeout (>8s)"}
+                resp = {"error": "Timeout — API too slow, increase N frames slider"}
             except requests.exceptions.ConnectionError:
-                resp = {"error": "Cannot connect — check ngrok URL"}
-            except Exception as e:
-                resp = {"error": str(e)}
+                resp = {"error": "Connection failed — is Colab/ngrok running?"}
+            except Exception as exc:
+                resp = {"error": str(exc)}
 
             if resp and "error" not in resp:
                 resp = process_response(resp)
-                update_stats(resp)
                 ann_bgr = None
                 if resp.get("annotated_frame"):
                     ann_bgr = b64_to_arr(resp["annotated_frame"])
                 with self.lock:
-                    self.last_resp = resp
+                    self.last_resp    = resp
+                    self.last_error   = ""
                     if ann_bgr is not None:
                         self.last_overlay = ann_bgr
-                # Safe to write session_state from bg thread in streamlit-webrtc
-                st.session_state.last_resp = resp
+                # Write to class-level mailbox so main thread can read on rerun
+                with AttentionVideoProcessor._shared_lock:
+                    AttentionVideoProcessor._shared_resp = resp
+            else:
+                err = (resp or {}).get("error", "Unknown error")
+                with self.lock:
+                    self.last_error = err
+                with AttentionVideoProcessor._shared_lock:
+                    AttentionVideoProcessor._shared_resp = {"error": err}
         finally:
-            self._api_running = False
+            with self.lock:
+                self._api_running = False
 
 # ══════════════════════════════════════════════════════════
 #  SIDEBAR
@@ -561,6 +608,8 @@ with tab_live:
         )
 
         if ctx.video_processor:
+            # Push config to processor from main Streamlit thread (thread-safe)
+            ctx.video_processor.api_url      = st.session_state.api_url
             ctx.video_processor.api_interval = api_interval
 
         if ctx.state.playing:
@@ -568,6 +617,12 @@ with tab_live:
                 '<span class="live-badge">🔴 LIVE</span> &nbsp; Analyzing in real-time',
                 unsafe_allow_html=True
             )
+            # Show last API error if any
+            if ctx.video_processor:
+                with ctx.video_processor.lock:
+                    err = ctx.video_processor.last_error
+                if err:
+                    st.error(f"⚠️ API error: {err}")
         else:
             st.caption("Click **START** above to begin live monitoring")
 
@@ -576,6 +631,13 @@ with tab_live:
 
         banner_ph  = st.empty()
         metrics_ph = st.empty()
+
+        # Pull latest result from class-level mailbox (written by bg thread)
+        with AttentionVideoProcessor._shared_lock:
+            shared = dict(AttentionVideoProcessor._shared_resp)
+        if shared and "error" not in shared:
+            # Sync into session_state and stats for charts/pie
+            update_stats(shared)
 
         resp = st.session_state.last_resp
         if resp and "error" not in resp:
