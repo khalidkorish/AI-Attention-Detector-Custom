@@ -7,7 +7,7 @@ Fixes & improvements:
            (looking at monitor/camera above monitor)
   - Natural (non-mirrored) view, HUD overlay, auto-refresh stats
 """
-import base64, time, io, threading
+import base64, time, io, threading, queue
 from datetime import datetime
 from collections import deque
 
@@ -403,54 +403,47 @@ def draw_hud(frame_bgr: np.ndarray, resp: dict | None) -> np.ndarray:
 # ══════════════════════════════════════════════════════════
 class AttentionVideoProcessor:
     """
-    Key design rules for streamlit-webrtc thread safety:
-    - recv() runs in a WebRTC worker thread — NEVER read st.session_state here
-    - All config (api_url, api_interval) is set on the instance by the main
-      Streamlit thread via ctx.video_processor.<attr> = value  AFTER webrtc_streamer()
-    - Background API thread only reads self.* attributes (protected by self.lock)
-      and writes self.last_resp / self.last_overlay — never touches session_state
-    - last_resp_shared is a plain list[dict] used as a thread-safe mailbox so the
-      main Streamlit thread can read the latest result on rerun without session_state
-      race conditions
+    Architecture:
+      - async_processing=False  →  recv() runs in a plain OS thread (not asyncio)
+      - recv() puts frames into a queue.Queue(maxsize=1); never calls the API itself
+      - A single persistent worker thread (_worker) drains the queue and calls the API
+      - Results written to self.last_resp / self.last_overlay under self.lock
+      - Class-level _shared_resp mailbox lets the Streamlit main thread read results
+        on each rerun WITHOUT touching st.session_state from a worker thread
     """
-    # Class-level shared result mailbox — main thread reads this on rerun
     _shared_resp: dict = {}
     _shared_lock = threading.Lock()
 
     def __init__(self):
-        self.frame_count  = 0
-        self.api_interval = 10        # updated by main thread after construction
-        self.api_url      = ""        # updated by main thread after construction
-        self.last_overlay = None      # last annotated BGR frame from API
-        self.last_resp    = None      # last response dict
-        self.last_error   = ""        # last error string for HUD display
+        self.api_interval = 10       # set by main thread: frames between API calls
+        self.api_url      = ""       # set by main thread: ngrok URL
+        self.last_overlay = None     # latest annotated BGR from API
+        self.last_resp    = None     # latest response dict
+        self.last_error   = ""       # latest error string
         self.lock         = threading.Lock()
-        self._api_running = False
 
+        # Queue holds at most 1 frame — recv() drops frames if worker is busy
+        self._frame_q     = queue.Queue(maxsize=1)
+        self._frame_count = 0
+        self._stop_evt    = threading.Event()
+
+        # Start persistent worker thread once at construction
+        self._worker_thread = threading.Thread(
+            target=self._worker, daemon=True
+        )
+        self._worker_thread.start()
+
+    # ── Called by WebRTC (plain OS thread, NOT asyncio) ──────────────────
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img_bgr = frame.to_ndarray(format="bgr24")
-        self.frame_count += 1
+        self._frame_count += 1
 
-        # Read config from instance attributes (set by main thread — safe)
-        with self.lock:
-            url      = self.api_url
-            interval = self.api_interval
-            running  = self._api_running
-
-        ready = (
-            url
-            and "xxxx" not in url
-            and not running
-            and self.frame_count % interval == 0
-        )
-        if ready:
-            with self.lock:
-                self._api_running = True
-            threading.Thread(
-                target=self._call_api,
-                args=(img_bgr.copy(), url),
-                daemon=True
-            ).start()
+        # Every api_interval frames: try to enqueue (drop if worker still busy)
+        if self._frame_count % self.api_interval == 0:
+            try:
+                self._frame_q.put_nowait(img_bgr.copy())
+            except queue.Full:
+                pass  # worker busy — skip this frame, don't block recv()
 
         with self.lock:
             overlay = self.last_overlay
@@ -464,21 +457,26 @@ class AttentionVideoProcessor:
         else:
             base = img_bgr
 
-        out = draw_hud(base, resp)
-        return av.VideoFrame.from_ndarray(out, format="bgr24")
+        return av.VideoFrame.from_ndarray(draw_hud(base, resp), format="bgr24")
+
+    # ── Persistent worker: blocks on queue, calls API, stores result ──────
+    def _worker(self):
+        while not self._stop_evt.is_set():
+            try:
+                img_bgr = self._frame_q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+            url = self.api_url          # read instance attr (set by main thread)
+            if not url or "xxxx" in url:
+                continue
+
+            self._call_api(img_bgr, url)
 
     def _call_api(self, img_bgr: np.ndarray, url: str):
-        """
-        Runs in a daemon thread.
-        Reads only: url (argument), self.lock
-        Writes only: self.last_resp, self.last_overlay, self._api_running,
-                     AttentionVideoProcessor._shared_resp
-        Never touches st.session_state.
-        """
         try:
             _, buf = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
             b64 = base64.b64encode(buf.tobytes()).decode()
-
             try:
                 r = requests.post(
                     f"{url.rstrip('/')}/predict",
@@ -488,9 +486,9 @@ class AttentionVideoProcessor:
                 r.raise_for_status()
                 resp = r.json()
             except requests.exceptions.Timeout:
-                resp = {"error": "Timeout — API too slow, increase N frames slider"}
+                resp = {"error": "Timeout — ngrok/API too slow"}
             except requests.exceptions.ConnectionError:
-                resp = {"error": "Connection failed — is Colab/ngrok running?"}
+                resp = {"error": "Cannot connect — is Colab running?"}
             except Exception as exc:
                 resp = {"error": str(exc)}
 
@@ -500,11 +498,10 @@ class AttentionVideoProcessor:
                 if resp.get("annotated_frame"):
                     ann_bgr = b64_to_arr(resp["annotated_frame"])
                 with self.lock:
-                    self.last_resp    = resp
-                    self.last_error   = ""
+                    self.last_resp  = resp
+                    self.last_error = ""
                     if ann_bgr is not None:
                         self.last_overlay = ann_bgr
-                # Write to class-level mailbox so main thread can read on rerun
                 with AttentionVideoProcessor._shared_lock:
                     AttentionVideoProcessor._shared_resp = resp
             else:
@@ -513,9 +510,9 @@ class AttentionVideoProcessor:
                     self.last_error = err
                 with AttentionVideoProcessor._shared_lock:
                     AttentionVideoProcessor._shared_resp = {"error": err}
-        finally:
+        except Exception as exc:
             with self.lock:
-                self._api_running = False
+                self.last_error = str(exc)
 
 # ══════════════════════════════════════════════════════════
 #  SIDEBAR
@@ -604,7 +601,7 @@ with tab_live:
                 "video": {"width": {"ideal": 640}, "height": {"ideal": 480}},
                 "audio": False
             },
-            async_processing=True,
+            async_processing=False,
         )
 
         if ctx.video_processor:
