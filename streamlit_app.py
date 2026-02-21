@@ -1,14 +1,11 @@
 """
 🎓 Student Attention Monitor — Streamlit Cloud (Real-Time Video)
-Uses streamlit-webrtc for live camera + supports image/video upload.
-Improvements v2:
-  - Mirrored (selfie-view) live camera
-  - Annotated frame overlaid on live feed in real-time
-  - HUD overlay (attention rate bar burned into video)
-  - Auto-refreshing stats panel (2s loop while live)
-  - Lower default API interval (10 frames) for more responsiveness
-  - Per-eye confidence now shown in face cards
-  - b64_to_arr helper avoids double PIL conversion
+Fixes & improvements:
+  - FIXED: StreamlitDuplicateElementId — all plotly_chart/pie calls now carry unique keys
+  - NEW:   Closed-eye detection: if both eyes closed ≥2s → DISTRACTED
+  - FIXED: Attentive = TopCenter / TopLeft / TopRight only
+           (looking at monitor/camera above monitor)
+  - Mirrored selfie view, HUD overlay, auto-refresh stats
 """
 import base64, time, io, threading
 from datetime import datetime
@@ -58,15 +55,31 @@ div[data-testid="stSidebar"]{background:#0f172a}
 </style>""", unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════
+#  CONSTANTS
+# ══════════════════════════════════════════════════════════
+# A person is ATTENTIVE only when looking at the screen/camera
+# (TopCenter, TopLeft, TopRight = looking forward/up at monitor)
+ATTENTIVE_DIRS  = {"TopLeft", "TopCenter", "TopRight"}
+# Partial = glancing sideways but not fully distracted
+PARTIAL_DIRS    = {"MiddleLeft", "MiddleRight"}
+# Distracted = looking down, closed eyes, or unknown
+DISTRACTED_DIRS = {"BottomLeft", "BottomCenter", "BottomRight", "EyesClosed"}
+
+# How long (seconds) both eyes must be closed to trigger DISTRACTED
+CLOSED_EYE_THRESHOLD_SEC = 2.0
+
+# ══════════════════════════════════════════════════════════
 #  SESSION STATE
 # ══════════════════════════════════════════════════════════
 DEFAULTS = {
-    "history":    deque(maxlen=180),
-    "stats":      dict(total=0, attentive=0, distracted=0, partial=0),
-    "api_url":    "https://xxxx-xx.ngrok-free.app",
-    "last_resp":  None,
-    "last_frame": None,
-    "lock":       threading.Lock(),
+    "history":          deque(maxlen=180),
+    "stats":            dict(total=0, attentive=0, distracted=0, partial=0),
+    "api_url":          "https://xxxx-xx.ngrok-free.app",
+    "last_resp":        None,
+    "last_frame":       None,
+    "lock":             threading.Lock(),
+    # Per-face closed-eye tracking: {face_id: timestamp_when_closed_started}
+    "eye_closed_since": {},
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -88,7 +101,6 @@ def b64_to_pil(b: str) -> Image.Image:
     return Image.open(io.BytesIO(base64.b64decode(b)))
 
 def b64_to_arr(b: str) -> np.ndarray:
-    """Base64 JPEG/PNG → BGR numpy array (no double PIL conversion)."""
     data = np.frombuffer(base64.b64decode(b), np.uint8)
     return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
@@ -114,6 +126,94 @@ def health():
 
 def emoji(a):
     return {"ATTENTIVE": "✅", "PARTIAL": "⚠️", "DISTRACTED": "❌"}.get(a, "❓")
+
+# ══════════════════════════════════════════════════════════
+#  CLOSED-EYE + ATTENTION OVERRIDE LOGIC
+# ══════════════════════════════════════════════════════════
+def is_eye_closed(face: dict) -> bool:
+    """
+    Return True if the API signals both eyes are closed.
+    We treat it as closed when crop_type='none' AND no left/right eye results
+    were returned (MediaPipe couldn't find iris/contour because lids are shut),
+    OR when the backend explicitly returns direction='EyesClosed'.
+    """
+    direction = face.get("direction", "")
+    if direction == "EyesClosed":
+        return True
+    # Both eye crops missing = eyes closed / face too angled
+    left_missing  = face.get("left_eye")  is None
+    right_missing = face.get("right_eye") is None
+    crop_none     = face.get("crop_type", "") == "none"
+    return left_missing and right_missing and crop_none
+
+def apply_attention_rules(faces: list) -> list:
+    """
+    Post-process the per-face list from the API to enforce:
+      1. ATTENTIVE only when direction in {TopLeft, TopCenter, TopRight}
+      2. Closed eyes for ≥ CLOSED_EYE_THRESHOLD_SEC → DISTRACTED (EyesClosed)
+    Returns a new list with overridden attention values.
+    """
+    now     = time.time()
+    tracker = st.session_state.eye_closed_since  # {face_id: float}
+    result  = []
+
+    for f in faces:
+        f = dict(f)  # shallow copy so we can mutate
+        fid = f.get("face_id", 0)
+
+        # ── Rule 1: eye-closed timer ─────────────────────────────────────
+        if is_eye_closed(f):
+            if fid not in tracker:
+                tracker[fid] = now          # start the clock
+            closed_for = now - tracker[fid]
+            if closed_for >= CLOSED_EYE_THRESHOLD_SEC:
+                f["attention"]  = "DISTRACTED"
+                f["direction"]  = "EyesClosed"
+                f["confidence"] = min(1.0, round(closed_for / 5.0, 2))  # grows with time
+        else:
+            # Eyes open — reset the timer for this face
+            tracker.pop(fid, None)
+
+            # ── Rule 2: strict attentive directions ──────────────────────
+            direction = f.get("direction", "")
+            if direction in ATTENTIVE_DIRS:
+                f["attention"] = "ATTENTIVE"
+            elif direction in PARTIAL_DIRS:
+                f["attention"] = "PARTIAL"
+            elif direction in DISTRACTED_DIRS or direction == "Unknown":
+                f["attention"] = "DISTRACTED"
+
+        result.append(f)
+
+    # Clean up stale face IDs that are no longer in the frame
+    active_ids = {f.get("face_id") for f in faces}
+    for stale in list(tracker.keys()):
+        if stale not in active_ids:
+            tracker.pop(stale, None)
+
+    return result
+
+def recompute_counts(faces: list) -> dict:
+    """Recompute aggregate counts after attention override."""
+    total      = len(faces)
+    attentive  = sum(1 for f in faces if f.get("attention") == "ATTENTIVE")
+    distracted = sum(1 for f in faces if f.get("attention") == "DISTRACTED")
+    partial    = sum(1 for f in faces if f.get("attention") == "PARTIAL")
+    rate       = round(attentive / total, 3) if total > 0 else 0.0
+    return dict(total_faces=total, attentive_count=attentive,
+                distracted_count=distracted, partial_count=partial,
+                attention_rate=rate)
+
+def process_response(resp: dict) -> dict:
+    """
+    Apply closed-eye + direction rules to a raw API response.
+    Returns the mutated response with corrected counts.
+    """
+    if not resp or "error" in resp:
+        return resp
+    faces = apply_attention_rules(resp.get("faces", []))
+    counts = recompute_counts(faces)
+    return {**resp, **counts, "faces": faces}
 
 def update_stats(resp: dict):
     if not resp or "error" in resp:
@@ -144,7 +244,7 @@ def banner_html(resp: dict) -> str:
     return f'<div class="sbanner {cls}">{ico} {lbl} — {att}/{tot} ({rate*100:.0f}%)</div>'
 
 # ══════════════════════════════════════════════════════════
-#  RENDER HELPERS
+#  RENDER HELPERS  (all chart calls include unique key=)
 # ══════════════════════════════════════════════════════════
 def draw_metrics():
     s    = st.session_state.stats
@@ -169,30 +269,38 @@ def draw_faces(ph, faces):
         return
     html = ""
     for f in faces:
-        dot = {"ATTENTIVE": "dg", "PARTIAL": "dy", "DISTRACTED": "dr"}.get(
-            f.get("attention", ""), "dgr")
-        le  = (f.get("left_eye")  or {}).get("direction", "N/A")
-        re  = (f.get("right_eye") or {}).get("direction", "N/A")
-        lc  = (f.get("left_eye")  or {}).get("confidence", 0)
-        rc  = (f.get("right_eye") or {}).get("confidence", 0)
-        crop  = f.get("crop_type", "")
-        cicon = {"iris": "🎯", "contour": "🔲", "none": "❓"}.get(crop, "")
-        meth  = f.get("method", "")
+        attn = f.get("attention", "")
+        dot  = {"ATTENTIVE": "dg", "PARTIAL": "dy", "DISTRACTED": "dr"}.get(attn, "dgr")
+        le   = (f.get("left_eye")  or {}).get("direction", "N/A")
+        re   = (f.get("right_eye") or {}).get("direction", "N/A")
+        lc   = (f.get("left_eye")  or {}).get("confidence", 0)
+        rc   = (f.get("right_eye") or {}).get("confidence", 0)
+        crop = f.get("crop_type", "")
+        meth = f.get("method", "")
+        cicon = {"iris": "🎯", "contour": "🔲", "none": "😑"}.get(crop, "")
         micon = {"agree": "🤝", "disagree_best": "⚖️",
                  "single_eye": "👁", "none": "—"}.get(meth, "")
+        # Special closed-eye display
+        if f.get("direction") == "EyesClosed":
+            eye_line = "😑 Eyes closed"
+        else:
+            eye_line = f"L: {le} ({lc*100:.0f}%) &nbsp; R: {re} ({rc*100:.0f}%)"
         html += (
             f'<div class="fcard"><span class="dot {dot}"></span>'
             f'<span style="color:#e2e8f0"><b>Face #{f["face_id"]}</b> '
-            f'{emoji(f["attention"])} {f["attention"]}<br>'
+            f'{emoji(attn)} {attn}<br>'
             f'<small style="color:#94a3b8">'
-            f'Gaze: <b>{f["direction"]}</b> ({f["confidence"]*100:.0f}%) '
-            f'| L: {le} ({lc*100:.0f}%) &nbsp; R: {re} ({rc*100:.0f}%)<br>'
+            f'Gaze: <b>{f.get("direction","?")}</b> ({f.get("confidence",0)*100:.0f}%)<br>'
+            f'{eye_line}<br>'
             f'Crop: {cicon} {crop} &nbsp;|&nbsp; Fusion: {micon} {meth}'
             f'</small></span></div>'
         )
     ph.markdown(html, unsafe_allow_html=True)
 
-def draw_chart(ph, threshold):
+def draw_chart(ph, threshold, chart_key: str):
+    """
+    chart_key must be unique per call site to avoid StreamlitDuplicateElementId.
+    """
     hist = list(st.session_state.history)
     if len(hist) < 2:
         ph.caption("Chart appears after a few frames...")
@@ -214,9 +322,12 @@ def draw_chart(ph, threshold):
         xaxis=dict(showgrid=False, color="#94a3b8"),
         font_color="#e2e8f0", showlegend=False
     )
-    ph.plotly_chart(fig, use_container_width=True)
+    ph.plotly_chart(fig, use_container_width=True, key=chart_key)
 
-def draw_pie(ph):
+def draw_pie(ph, pie_key: str):
+    """
+    pie_key must be unique per call site to avoid StreamlitDuplicateElementId.
+    """
     s     = st.session_state.stats
     total = s["attentive"] + s["distracted"] + s["partial"]
     if total == 0:
@@ -233,18 +344,16 @@ def draw_pie(ph):
         paper_bgcolor="rgba(0,0,0,0)", font_color="#e2e8f0",
         showlegend=True, legend=dict(orientation="h", y=-0.15)
     )
-    ph.plotly_chart(fig, use_container_width=True)
+    ph.plotly_chart(fig, use_container_width=True, key=pie_key)
 
 # ══════════════════════════════════════════════════════════
-#  HUD OVERLAY  — burns live attention info into video frame
+#  HUD OVERLAY
 # ══════════════════════════════════════════════════════════
 def draw_hud(frame_bgr: np.ndarray, resp: dict | None) -> np.ndarray:
-    """Overlay a semi-transparent attention HUD on the frame."""
     out  = frame_bgr.copy()
     h, w = out.shape[:2]
 
     if not resp or "error" in resp:
-        # Minimal HUD when no result yet
         overlay = out.copy()
         cv2.rectangle(overlay, (0, 0), (w, 34), (15, 23, 42), -1)
         cv2.addWeighted(overlay, 0.7, out, 0.3, 0, out)
@@ -255,88 +364,72 @@ def draw_hud(frame_bgr: np.ndarray, resp: dict | None) -> np.ndarray:
     rate  = resp.get("attention_rate", 0)
     att   = resp.get("attentive_count", 0)
     tot   = resp.get("total_faces", 0)
+
+    # Check if any face has closed eyes right now
+    closed_faces = sum(
+        1 for f in resp.get("faces", [])
+        if f.get("direction") == "EyesClosed"
+    )
+    closed_tag = f"  😑 {closed_faces} closed" if closed_faces else ""
+
     color = (0, 210, 0) if rate >= 0.7 else ((0, 190, 255) if rate >= 0.4 else (0, 0, 220))
 
-    # Semi-transparent top bar
     overlay = out.copy()
     cv2.rectangle(overlay, (0, 0), (w, 38), (15, 23, 42), -1)
     cv2.addWeighted(overlay, 0.75, out, 0.25, 0, out)
 
-    label = f"Attention: {rate*100:.0f}%  |  Faces: {att}/{tot}"
-    cv2.putText(out, label, (10, 26), cv2.FONT_HERSHEY_DUPLEX, 0.65, color,    2, cv2.LINE_AA)
-    cv2.putText(out, label, (10, 26), cv2.FONT_HERSHEY_DUPLEX, 0.65, (240,240,240), 1, cv2.LINE_AA)
+    label = f"Attention: {rate*100:.0f}%  |  Faces: {att}/{tot}{closed_tag}"
+    cv2.putText(out, label, (10, 26), cv2.FONT_HERSHEY_DUPLEX, 0.62, color,        2, cv2.LINE_AA)
+    cv2.putText(out, label, (10, 26), cv2.FONT_HERSHEY_DUPLEX, 0.62, (240,240,240),1, cv2.LINE_AA)
 
-    # Bottom attention progress bar
     bar_h = 6
     cv2.rectangle(out, (0, h - bar_h), (w, h), (30, 30, 30), -1)
     cv2.rectangle(out, (0, h - bar_h), (int(w * rate), h), color, -1)
-
     return out
 
 # ══════════════════════════════════════════════════════════
-#  WEBRTC VIDEO PROCESSOR  (real-time, mirrored, HUD)
+#  WEBRTC VIDEO PROCESSOR
 # ══════════════════════════════════════════════════════════
 class AttentionVideoProcessor:
-    """
-    Each webcam frame is:
-    1. Flipped horizontally → natural selfie mirror view
-    2. Every api_interval frames → sent to FastAPI in a background thread
-    3. Last annotated frame from API is blended with HUD and returned
-    """
     def __init__(self):
         self.frame_count  = 0
-        self.api_interval = 10        # ~3×/sec at 30fps  (was 15)
-        self.last_overlay = None      # last annotated BGR from API
+        self.api_interval = 10
+        self.last_overlay = None
         self.last_resp    = None
         self.lock         = threading.Lock()
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img_bgr = frame.to_ndarray(format="bgr24")
-
-        # ── 1. Mirror for selfie / natural classroom view ─────────────
-        img_bgr = cv2.flip(img_bgr, 1)
-
+        img_bgr = cv2.flip(img_bgr, 1)   # mirror selfie view
         self.frame_count += 1
 
-        # ── 2. Fire API call in background thread ─────────────────────
         if self.frame_count % self.api_interval == 0:
-            threading.Thread(
-                target=self._call_api,
-                args=(img_bgr.copy(),),
-                daemon=True
-            ).start()
+            threading.Thread(target=self._call_api, args=(img_bgr.copy(),), daemon=True).start()
 
-        # ── 3. Compose output frame ───────────────────────────────────
         with self.lock:
             overlay = self.last_overlay
             resp    = self.last_resp
 
-        if overlay is not None and overlay.shape == img_bgr.shape:
-            # Use API-annotated frame (already has bounding boxes + labels)
-            base = overlay
-        else:
-            base = img_bgr
-
-        out = draw_hud(base, resp)
+        base = overlay if (overlay is not None and overlay.shape == img_bgr.shape) else img_bgr
+        out  = draw_hud(base, resp)
         return av.VideoFrame.from_ndarray(out, format="bgr24")
 
     def _call_api(self, img_bgr: np.ndarray):
-        """Background thread: call API, store result."""
         b64  = arr_to_b64(img_bgr)
         resp = call_api(b64)
         if resp and "error" not in resp:
+            # Apply closed-eye + direction rules before storing
+            resp = process_response(resp)
             update_stats(resp)
             ann_bgr = None
             if resp.get("annotated_frame"):
                 ann_bgr = b64_to_arr(resp["annotated_frame"])
                 if ann_bgr is not None:
-                    # Mirror annotated frame to match selfie view
                     ann_bgr = cv2.flip(ann_bgr, 1)
             with self.lock:
                 self.last_resp    = resp
                 if ann_bgr is not None:
                     self.last_overlay = ann_bgr
-            # Push to session state so sidebar stats panel can read it
             st.session_state.last_resp = resp
 
 # ══════════════════════════════════════════════════════════
@@ -364,22 +457,24 @@ with st.sidebar:
     alert_threshold = st.slider("⚠️ Alert below (%)", 10, 90, 50, 5)
     api_interval    = st.slider(
         "🔄 API call every N frames", 5, 60, 10, 5,
-        help="Lower = more real-time but heavier. 10 ≈ 3×/sec at 30fps"
+        help="10 ≈ 3×/sec at 30fps"
     )
 
     st.divider()
-    st.markdown("### 📖 Direction → Attention")
-    st.markdown("""| Direction | Status |
-|-----------|--------|
-| Top L/C/R | ✅ Attentive |
-| Middle L/R | ⚠️ Partial |
-| Bottom L/C/R | ❌ Distracted |""")
+    st.markdown("### 📖 Attention Rules")
+    st.markdown("""| Gaze Direction | Status |
+|----------------|--------|
+| Top L / C / R | ✅ Attentive |
+| Middle L / R | ⚠️ Partial |
+| Bottom L / C / R | ❌ Distracted |
+| Eyes closed ≥ 2s | ❌ Distracted |""")
 
     st.divider()
     if st.button("🗑️ Reset Stats", use_container_width=True):
-        st.session_state.stats     = dict(total=0, attentive=0, distracted=0, partial=0)
-        st.session_state.history   = deque(maxlen=180)
-        st.session_state.last_resp = None
+        st.session_state.stats           = dict(total=0, attentive=0, distracted=0, partial=0)
+        st.session_state.history         = deque(maxlen=180)
+        st.session_state.last_resp       = None
+        st.session_state.eye_closed_since = {}
         st.rerun()
 
 # ══════════════════════════════════════════════════════════
@@ -387,7 +482,7 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════
 st.markdown("""<div class="main-header">
   <h1>🎓 Student Attention Monitor</h1>
-  <p>Real-time gaze detection — GazeNet8 (8-direction) via FastAPI + ngrok</p>
+  <p>Real-time gaze detection — GazeNet8 (8-direction) + closed-eye detection via FastAPI + ngrok</p>
 </div>""", unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════
@@ -401,14 +496,14 @@ tab_live, tab_snap, tab_img, tab_vid = st.tabs([
 ])
 
 # ─────────────────────────────────────────────────────────
-#  TAB 1 — LIVE CAMERA (WebRTC real-time)
+#  TAB 1 — LIVE CAMERA
 # ─────────────────────────────────────────────────────────
 with tab_live:
     cl, cr = st.columns([3, 2], gap="large")
 
     with cl:
         st.markdown("### 📹 Live Camera Feed")
-        st.info("🪞 Camera is **mirrored** (selfie view). Bounding boxes + HUD update automatically.")
+        st.info("🪞 Mirrored view. Boxes + HUD auto-update. Eyes closed ≥2s → Distracted.")
 
         RTC_CONFIG = RTCConfiguration({"iceServers": [
             {"urls": ["stun:stun.l.google.com:19302"]},
@@ -427,7 +522,6 @@ with tab_live:
             async_processing=True,
         )
 
-        # Sync sidebar slider to processor
         if ctx.video_processor:
             ctx.video_processor.api_interval = api_interval
 
@@ -442,7 +536,6 @@ with tab_live:
     with cr:
         st.markdown("### 📊 Live Session Statistics")
 
-        # ── Placeholders for auto-refreshed stats ─────────────────────
         banner_ph  = st.empty()
         metrics_ph = st.empty()
 
@@ -462,22 +555,18 @@ with tab_live:
 
         st.divider()
         st.markdown("### 📈 Attention Over Time")
-        chart_ph = st.empty()
-        draw_chart(chart_ph, alert_threshold)
+        draw_chart(st.empty(), alert_threshold, chart_key="chart_live")
 
         st.divider()
         st.markdown("### 🎯 Gaze Distribution")
-        pie_ph = st.empty()
-        draw_pie(pie_ph)
+        draw_pie(st.empty(), pie_key="pie_live")
 
-        # ── Auto-refresh controls ──────────────────────────────────────
         col_btn, col_tog = st.columns(2)
         if col_btn.button("🔄 Refresh Stats", use_container_width=True):
             st.rerun()
 
         auto_refresh = col_tog.toggle("⚡ Auto Refresh", value=True)
         if auto_refresh and ctx.state.playing:
-            # Rerun every 2 seconds to pull latest last_resp into the UI
             time.sleep(2)
             st.rerun()
 
@@ -498,13 +587,13 @@ with tab_snap:
             with st.spinner("Analyzing..."):
                 resp = call_api(b64)
             if resp and "error" not in resp:
+                resp = process_response(resp)
                 update_stats(resp)
                 banner_ph2.markdown(banner_html(resp), unsafe_allow_html=True)
                 if resp.get("annotated_frame"):
                     frame_ph2.image(b64_to_pil(resp["annotated_frame"]),
                                     caption="Annotated", use_container_width=True)
-                rate = resp.get("attention_rate", 0)
-                if resp["total_faces"] > 0 and rate * 100 < alert_threshold:
+                if resp["total_faces"] > 0 and resp.get("attention_rate", 0) * 100 < alert_threshold:
                     st.toast(f"⚠️ Attention below {alert_threshold}%!", icon="⚠️")
                 with st.expander("🔍 Raw JSON"):
                     st.json(resp)
@@ -516,10 +605,10 @@ with tab_snap:
         draw_metrics()
         st.divider()
         st.markdown("### 📈 Attention Over Time")
-        draw_chart(st.empty(), alert_threshold)
+        draw_chart(st.empty(), alert_threshold, chart_key="chart_snap")
         st.divider()
         st.markdown("### 🎯 Gaze Distribution")
-        draw_pie(st.empty())
+        draw_pie(st.empty(), pie_key="pie_snap")
         resp = st.session_state.last_resp
         if resp and resp.get("faces"):
             st.divider()
@@ -545,6 +634,7 @@ with tab_img:
                 with st.spinner("Analyzing..."):
                     resp = call_api(arr_to_b64(img))
                 if resp and "error" not in resp:
+                    resp = process_response(resp)
                     update_stats(resp)
                     st.markdown(banner_html(resp), unsafe_allow_html=True)
                     if resp.get("annotated_frame"):
@@ -559,7 +649,7 @@ with tab_img:
         draw_metrics()
         st.divider()
         st.markdown("### 🎯 Gaze Distribution")
-        draw_pie(st.empty())
+        draw_pie(st.empty(), pie_key="pie_img")
         resp = st.session_state.last_resp
         if resp and resp.get("faces"):
             st.divider()
@@ -593,6 +683,7 @@ with tab_vid:
                     if idx % fstep == 0:
                         resp = call_api(arr_to_b64(frame))
                         if resp and "error" not in resp:
+                            resp = process_response(resp)
                             update_stats(resp)
                             if resp.get("annotated_frame"):
                                 vf.image(b64_to_pil(resp["annotated_frame"]),
@@ -618,7 +709,7 @@ with tab_vid:
         draw_metrics()
         st.divider()
         st.markdown("### 📈 Attention Over Time")
-        draw_chart(st.empty(), alert_threshold)
+        draw_chart(st.empty(), alert_threshold, chart_key="chart_vid")
         st.divider()
         st.markdown("### 🎯 Gaze Distribution")
-        draw_pie(st.empty())
+        draw_pie(st.empty(), pie_key="pie_vid")
