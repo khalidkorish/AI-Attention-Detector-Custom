@@ -5,7 +5,7 @@ Fixes & improvements:
   - NEW:   Closed-eye detection: if both eyes closed ≥2s → DISTRACTED
   - FIXED: Attentive = TopCenter / TopLeft / TopRight only
            (looking at monitor/camera above monitor)
-  - Mirrored selfie view, HUD overlay, auto-refresh stats
+  - Natural (non-mirrored) view, HUD overlay, auto-refresh stats
 """
 import base64, time, io, threading
 from datetime import datetime
@@ -394,43 +394,81 @@ class AttentionVideoProcessor:
     def __init__(self):
         self.frame_count  = 0
         self.api_interval = 10
-        self.last_overlay = None
+        self.last_overlay = None   # last annotated BGR from API
         self.last_resp    = None
         self.lock         = threading.Lock()
+        self._api_running = False  # prevent overlapping API calls
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img_bgr = frame.to_ndarray(format="bgr24")
-        img_bgr = cv2.flip(img_bgr, 1)   # mirror selfie view
+        # Natural view — no horizontal flip
         self.frame_count += 1
 
-        if self.frame_count % self.api_interval == 0:
-            threading.Thread(target=self._call_api, args=(img_bgr.copy(),), daemon=True).start()
+        # Capture URL in this thread (safe), pass it to background thread
+        api_url = st.session_state.get("api_url", "")
+
+        # Only fire a new call if previous finished and URL is set
+        if (self.frame_count % self.api_interval == 0
+                and not self._api_running
+                and api_url
+                and "xxxx" not in api_url):
+            self._api_running = True
+            threading.Thread(
+                target=self._call_api,
+                args=(img_bgr.copy(), api_url),
+                daemon=True
+            ).start()
 
         with self.lock:
             overlay = self.last_overlay
             resp    = self.last_resp
 
-        base = overlay if (overlay is not None and overlay.shape == img_bgr.shape) else img_bgr
-        out  = draw_hud(base, resp)
+        # Use annotated overlay; resize to live frame if dimensions differ
+        if overlay is not None:
+            h, w = img_bgr.shape[:2]
+            if overlay.shape[:2] != (h, w):
+                overlay = cv2.resize(overlay, (w, h), interpolation=cv2.INTER_LINEAR)
+            base = overlay
+        else:
+            base = img_bgr
+
+        out = draw_hud(base, resp)
         return av.VideoFrame.from_ndarray(out, format="bgr24")
 
-    def _call_api(self, img_bgr: np.ndarray):
-        b64  = arr_to_b64(img_bgr)
-        resp = call_api(b64)
-        if resp and "error" not in resp:
-            # Apply closed-eye + direction rules before storing
-            resp = process_response(resp)
-            update_stats(resp)
-            ann_bgr = None
-            if resp.get("annotated_frame"):
-                ann_bgr = b64_to_arr(resp["annotated_frame"])
-                if ann_bgr is not None:
-                    ann_bgr = cv2.flip(ann_bgr, 1)
-            with self.lock:
-                self.last_resp    = resp
-                if ann_bgr is not None:
-                    self.last_overlay = ann_bgr
-            st.session_state.last_resp = resp
+    def _call_api(self, img_bgr: np.ndarray, api_url: str):
+        """Background thread — uses pre-captured URL, never touches session_state directly."""
+        try:
+            _, buf = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            b64 = base64.b64encode(buf.tobytes()).decode()
+            try:
+                r = requests.post(
+                    f"{api_url.rstrip('/')}/predict",
+                    json={"image": b64},
+                    timeout=8
+                )
+                r.raise_for_status()
+                resp = r.json()
+            except requests.exceptions.Timeout:
+                resp = {"error": "Timeout (>8s)"}
+            except requests.exceptions.ConnectionError:
+                resp = {"error": "Cannot connect — check ngrok URL"}
+            except Exception as e:
+                resp = {"error": str(e)}
+
+            if resp and "error" not in resp:
+                resp = process_response(resp)
+                update_stats(resp)
+                ann_bgr = None
+                if resp.get("annotated_frame"):
+                    ann_bgr = b64_to_arr(resp["annotated_frame"])
+                with self.lock:
+                    self.last_resp = resp
+                    if ann_bgr is not None:
+                        self.last_overlay = ann_bgr
+                # Safe to write session_state from bg thread in streamlit-webrtc
+                st.session_state.last_resp = resp
+        finally:
+            self._api_running = False
 
 # ══════════════════════════════════════════════════════════
 #  SIDEBAR
@@ -503,7 +541,7 @@ with tab_live:
 
     with cl:
         st.markdown("### 📹 Live Camera Feed")
-        st.info("🪞 Mirrored view. Boxes + HUD auto-update. Eyes closed ≥2s → Distracted.")
+        st.info("📡 Live stream — bounding boxes + HUD update automatically. Eyes closed ≥2s → Distracted.")
 
         RTC_CONFIG = RTCConfiguration({"iceServers": [
             {"urls": ["stun:stun.l.google.com:19302"]},
