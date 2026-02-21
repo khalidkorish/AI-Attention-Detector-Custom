@@ -68,6 +68,12 @@ DISTRACTED_DIRS = {"BottomLeft", "BottomCenter", "BottomRight", "EyesClosed"}
 # How long (seconds) both eyes must be closed to trigger DISTRACTED
 CLOSED_EYE_THRESHOLD_SEC = 2.0
 
+# Module-level eye-closed timer dict — intentionally NOT in session_state.
+# session_state is unreliable from worker threads and can be cleared by Reset.
+# This dict lives at module scope, persists across reruns, safe to read/write
+# from the main Streamlit thread only (process_response is main-thread-only).
+_eye_closed_since: dict = {}
+
 # ══════════════════════════════════════════════════════════
 #  SESSION STATE
 # ══════════════════════════════════════════════════════════
@@ -78,7 +84,6 @@ if "api_url"          not in st.session_state: st.session_state.api_url         
 if "last_resp"        not in st.session_state: st.session_state.last_resp        = None
 if "last_frame"       not in st.session_state: st.session_state.last_frame       = None
 if "lock"             not in st.session_state: st.session_state.lock             = threading.Lock()
-if "eye_closed_since" not in st.session_state: st.session_state.eye_closed_since = {}
 if "_last_stats_key"  not in st.session_state: st.session_state._last_stats_key  = ""
 
 # ══════════════════════════════════════════════════════════
@@ -142,35 +147,29 @@ def is_eye_closed(face: dict) -> bool:
     crop_none     = face.get("crop_type", "") == "none"
     return left_missing and right_missing and crop_none
 
-def apply_attention_rules(faces: list) -> list:
+def apply_attention_rules(faces: list, tracker: dict) -> list:
     """
-    Post-process the per-face list from the API to enforce:
-      1. ATTENTIVE only when direction in {TopLeft, TopCenter, TopRight}
-      2. Closed eyes for ≥ CLOSED_EYE_THRESHOLD_SEC → DISTRACTED (EyesClosed)
-    Returns a new list with overridden attention values.
+    Post-process faces from the API.
+    tracker: a plain dict {face_id: closed_since_timestamp} — NOT session_state.
+             Caller owns it and passes it in; this function mutates it in place.
     """
-    now     = time.time()
-    tracker = st.session_state.eye_closed_since  # {face_id: float}
-    result  = []
+    now    = time.time()
+    result = []
 
     for f in faces:
-        f = dict(f)  # shallow copy so we can mutate
+        f   = dict(f)
         fid = f.get("face_id", 0)
 
-        # ── Rule 1: eye-closed timer ─────────────────────────────────────
         if is_eye_closed(f):
             if fid not in tracker:
-                tracker[fid] = now          # start the clock
+                tracker[fid] = now
             closed_for = now - tracker[fid]
             if closed_for >= CLOSED_EYE_THRESHOLD_SEC:
                 f["attention"]  = "DISTRACTED"
                 f["direction"]  = "EyesClosed"
-                f["confidence"] = min(1.0, round(closed_for / 5.0, 2))  # grows with time
+                f["confidence"] = min(1.0, round(closed_for / 5.0, 2))
         else:
-            # Eyes open — reset the timer for this face
             tracker.pop(fid, None)
-
-            # ── Rule 2: strict attentive directions ──────────────────────
             direction = f.get("direction", "")
             if direction in ATTENTIVE_DIRS:
                 f["attention"] = "ATTENTIVE"
@@ -181,7 +180,6 @@ def apply_attention_rules(faces: list) -> list:
 
         result.append(f)
 
-    # Clean up stale face IDs that are no longer in the frame
     active_ids = {f.get("face_id") for f in faces}
     for stale in list(tracker.keys()):
         if stale not in active_ids:
@@ -200,14 +198,14 @@ def recompute_counts(faces: list) -> dict:
                 distracted_count=distracted, partial_count=partial,
                 attention_rate=rate)
 
-def process_response(resp: dict) -> dict:
+def process_response(resp: dict, tracker: dict) -> dict:
     """
     Apply closed-eye + direction rules to a raw API response.
-    Returns the mutated response with corrected counts.
+    tracker: plain dict owned by caller (not session_state) — safe to call from any thread.
     """
     if not resp or "error" in resp:
         return resp
-    faces = apply_attention_rules(resp.get("faces", []))
+    faces  = apply_attention_rules(resp.get("faces", []), tracker)
     counts = recompute_counts(faces)
     return {**resp, **counts, "faces": faces}
 
@@ -489,7 +487,8 @@ class AttentionVideoProcessor:
                 resp = {"error": str(exc)}
 
             if resp and "error" not in resp:
-                resp = process_response(resp)
+                # Store RAW response — process_response (eye-closed timer etc.)
+                # is applied by the main Streamlit thread on rerun, not here.
                 ann_bgr = None
                 if resp.get("annotated_frame"):
                     ann_bgr = b64_to_arr(resp["annotated_frame"])
@@ -549,10 +548,11 @@ with st.sidebar:
 
     st.divider()
     if st.button("🗑️ Reset Stats", use_container_width=True):
-        st.session_state.stats           = dict(total=0, attentive=0, distracted=0, partial=0)
-        st.session_state.history         = deque(maxlen=180)
-        st.session_state.last_resp       = None
-        st.session_state.eye_closed_since = {}
+        st.session_state.stats     = dict(total=0, attentive=0, distracted=0, partial=0)
+        st.session_state.history   = deque(maxlen=180)
+        st.session_state.last_resp = None
+        _eye_closed_since.clear()
+        AttentionVideoProcessor._shared_resp = {}
         st.rerun()
 
 # ══════════════════════════════════════════════════════════
@@ -629,7 +629,8 @@ with tab_live:
         with AttentionVideoProcessor._shared_lock:
             shared = dict(AttentionVideoProcessor._shared_resp)
         if shared and "error" not in shared:
-            # Sync into session_state and stats for charts/pie
+            # Apply attention rules HERE in the main thread (safe to use session_state)
+            shared = process_response(shared, _eye_closed_since)
             update_stats(shared)
 
         resp = st.session_state.last_resp
@@ -680,7 +681,7 @@ with tab_snap:
             with st.spinner("Analyzing..."):
                 resp = call_api(b64)
             if resp and "error" not in resp:
-                resp = process_response(resp)
+                resp = process_response(resp, _eye_closed_since)
                 update_stats(resp)
                 banner_ph2.markdown(banner_html(resp), unsafe_allow_html=True)
                 if resp.get("annotated_frame"):
@@ -727,7 +728,7 @@ with tab_img:
                 with st.spinner("Analyzing..."):
                     resp = call_api(arr_to_b64(img))
                 if resp and "error" not in resp:
-                    resp = process_response(resp)
+                    resp = process_response(resp, _eye_closed_since)
                     update_stats(resp)
                     st.markdown(banner_html(resp), unsafe_allow_html=True)
                     if resp.get("annotated_frame"):
@@ -776,7 +777,7 @@ with tab_vid:
                     if idx % fstep == 0:
                         resp = call_api(arr_to_b64(frame))
                         if resp and "error" not in resp:
-                            resp = process_response(resp)
+                            resp = process_response(resp, _eye_closed_since)
                             update_stats(resp)
                             if resp.get("annotated_frame"):
                                 vf.image(b64_to_pil(resp["annotated_frame"]),
