@@ -71,19 +71,15 @@ CLOSED_EYE_THRESHOLD_SEC = 2.0
 # ══════════════════════════════════════════════════════════
 #  SESSION STATE
 # ══════════════════════════════════════════════════════════
-DEFAULTS = {
-    "history":          deque(maxlen=180),
-    "stats":            dict(total=0, attentive=0, distracted=0, partial=0),
-    "api_url":          "https://xxxx-xx.ngrok-free.app",
-    "last_resp":        None,
-    "last_frame":       None,
-    "lock":             threading.Lock(),
-    # Per-face closed-eye tracking: {face_id: timestamp_when_closed_started}
-    "eye_closed_since": {},
-}
-for k, v in DEFAULTS.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+# Initialize each key with a fresh object — never share mutable defaults across sessions
+if "history"          not in st.session_state: st.session_state.history          = deque(maxlen=180)
+if "stats"            not in st.session_state: st.session_state.stats            = dict(total=0, attentive=0, distracted=0, partial=0)
+if "api_url"          not in st.session_state: st.session_state.api_url          = "https://xxxx-xx.ngrok-free.app"
+if "last_resp"        not in st.session_state: st.session_state.last_resp        = None
+if "last_frame"       not in st.session_state: st.session_state.last_frame       = None
+if "lock"             not in st.session_state: st.session_state.lock             = threading.Lock()
+if "eye_closed_since" not in st.session_state: st.session_state.eye_closed_since = {}
+if "_last_stats_key"  not in st.session_state: st.session_state._last_stats_key  = ""
 
 # ══════════════════════════════════════════════════════════
 #  HELPERS
