@@ -474,7 +474,6 @@ with st.sidebar:
 #  TOPBAR  (with dark/light toggle button)
 # ══════════════════════════════════════════════════════════
 t=T()
-left_col, right_col = st.columns([1, 0])   # right_col just for the button
 
 # Draw topbar HTML
 st.markdown(f"""<div class="topbar">
