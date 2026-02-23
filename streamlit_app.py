@@ -88,7 +88,11 @@ def inject_css():
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap');
 
 html,body,[class*="css"]{{font-family:'Syne',sans-serif;}}
-#MainMenu,footer,header{{visibility:hidden;}}
+/* Keep header visible so the sidebar toggle arrow is always accessible */
+footer{{visibility:hidden;}}
+#MainMenu{{visibility:hidden;}}
+[data-testid="stToolbar"]{{visibility:hidden;}}
+[data-testid="stDecoration"]{{display:none;}}
 .block-container{{padding-top:.6rem;}}
 .stApp{{background:{t['app_bg']};}}
 section[data-testid="stSidebar"]{{background:{t['panel_bg']}!important;border-right:1px solid {t['border']};}}
@@ -493,6 +497,18 @@ with btn_col:
     if st.button(label, use_container_width=True, key="theme_toggle"):
         st.session_state.dark_mode = not st.session_state.dark_mode
         st.rerun()
+
+# ══════════════════════════════════════════════════════════
+#  SIDEBAR HINT  (shown only when sidebar is collapsed)
+# ══════════════════════════════════════════════════════════
+st.markdown(f"""
+<div style="font-family:'JetBrains Mono',monospace;font-size:.7rem;
+  color:{t['text_dim']};margin-bottom:.5rem;">
+  ← <strong style="color:{t['text_mid']}">Sidebar</strong>
+  contains: ngrok URL · Settings · State Reference
+  &nbsp;|&nbsp; Click the <strong style="color:{t['text_mid']}">▶</strong>
+  arrow on the left edge to open it.
+</div>""", unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════
 #  TABS
