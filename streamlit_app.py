@@ -88,11 +88,18 @@ def inject_css():
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap');
 
 html,body,[class*="css"]{{font-family:'Syne',sans-serif;}}
-/* Keep header visible so the sidebar toggle arrow is always accessible */
+/* Hide only footer and deploy menu — keep header+sidebar toggle fully visible */
 footer{{visibility:hidden;}}
 #MainMenu{{visibility:hidden;}}
-[data-testid="stToolbar"]{{visibility:hidden;}}
-[data-testid="stDecoration"]{{display:none;}}
+/* Sidebar toggle button — force visible and styled */
+[data-testid="collapsedControl"]{{
+  display:block!important;
+  visibility:visible!important;
+  opacity:1!important;
+}}
+button[kind="header"]{{
+  visibility:visible!important;
+}}
 .block-container{{padding-top:.6rem;}}
 .stApp{{background:{t['app_bg']};}}
 section[data-testid="stSidebar"]{{background:{t['panel_bg']}!important;border-right:1px solid {t['border']};}}
@@ -163,15 +170,16 @@ section[data-testid="stSidebar"]{{background:{t['panel_bg']}!important;border-ri
   background:{t['panel_bg']};border:1px solid {t['border']};border-radius:4px;
   padding:.1rem .4rem;display:inline-block;margin-left:.5rem;}}
 
-/* ── Streamlit widget overrides for light mode ───────── */
+/* ── Streamlit widget overrides ─────────────────────── */
 .stTextInput>div>div>input{{
-  background:{t['panel_bg']}!important;color:{t['text_main']}!important;
+  background:{t['panel_bg']}!important;
+  color:{t['text_main']}!important;
   border-color:{t['border']}!important;}}
-.stSlider [data-baseweb="slider"]{{background:{t['border']};}}
-label, .stMarkdown p{{color:{t['text_mid']}!important;}}
-h1,h2,h3,h4,h5,h6{{color:{t['text_main']}!important;}}
 .stTabs [data-baseweb="tab"]{{color:{t['text_dim']}!important;}}
-.stTabs [aria-selected="true"]{{color:{t['text_main']}!important;}}
+.stTabs [aria-selected="true"]{{color:{t['text_main']}!important;border-bottom-color:{t['att_fg']}!important;}}
+/* Streamlit sidebar content text */
+section[data-testid="stSidebar"] .stMarkdown p{{color:{t['text_mid']}!important;}}
+section[data-testid="stSidebar"] label{{color:{t['text_mid']}!important;}}
 </style>""", unsafe_allow_html=True)
 
 inject_css()
@@ -475,40 +483,32 @@ with st.sidebar:
         st.rerun()
 
 # ══════════════════════════════════════════════════════════
-#  TOPBAR  (with dark/light toggle button)
+#  TOPBAR  (title left · toggle button right)
 # ══════════════════════════════════════════════════════════
-t=T()
+t = T()
 
-# Draw topbar HTML
-st.markdown(f"""<div class="topbar">
+title_col, toggle_col = st.columns([4, 1])
+with title_col:
+    st.markdown(f"""<div class="topbar">
   <div class="topbar-left">
     <div class="topbar-title">🎓 Student Attention Monitor</div>
-    <div class="topbar-sub">GazeNet8 · FP16 TorchScript · MediaPipe Iris · 3-State</div>
-  </div>
-  <div class="topbar-right">
-    <span class="topbar-states">ATTENTIVE &nbsp;·&nbsp; DISTRACTED &nbsp;·&nbsp; SLEEP</span>
+    <div class="topbar-sub">GazeNet8 · FP16 TorchScript · MediaPipe Iris · 3-State
+      &nbsp;·&nbsp;
+      <span style="color:{t['att_fg']}">ATTENTIVE</span>
+      &nbsp;·&nbsp;
+      <span style="color:{t['dis_fg']}">DISTRACTED</span>
+      &nbsp;·&nbsp;
+      <span style="color:{t['slp_fg']}">SLEEP</span>
+    </div>
   </div>
 </div>""", unsafe_allow_html=True)
 
-# Dark/Light toggle — sits just below topbar, right-aligned
-_, btn_col = st.columns([5, 1])
-with btn_col:
-    label = f"{t['mode_icon']} {t['mode_label']}"
+with toggle_col:
+    st.markdown("<div style='height:.35rem'></div>", unsafe_allow_html=True)
+    label = f"{t['mode_icon']}  {t['mode_label']}"
     if st.button(label, use_container_width=True, key="theme_toggle"):
         st.session_state.dark_mode = not st.session_state.dark_mode
         st.rerun()
-
-# ══════════════════════════════════════════════════════════
-#  SIDEBAR HINT  (shown only when sidebar is collapsed)
-# ══════════════════════════════════════════════════════════
-st.markdown(f"""
-<div style="font-family:'JetBrains Mono',monospace;font-size:.7rem;
-  color:{t['text_dim']};margin-bottom:.5rem;">
-  ← <strong style="color:{t['text_mid']}">Sidebar</strong>
-  contains: ngrok URL · Settings · State Reference
-  &nbsp;|&nbsp; Click the <strong style="color:{t['text_mid']}">▶</strong>
-  arrow on the left edge to open it.
-</div>""", unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════
 #  TABS
